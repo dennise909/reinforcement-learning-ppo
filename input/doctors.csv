@@ -1,0 +1,4 @@
+doctor_id,doctor,especialidad,day_start_min,n_slots
+0,Dr. A,General,540,32
+1,Dr. B,Cardiología,540,32
+2,Dr. C,Pediatría,540,32
