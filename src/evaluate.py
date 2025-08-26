@@ -10,10 +10,14 @@ def eval_once(model, env: ClinicSchedulingEnv):
     obs, _ = env.reset()
     done = False
     assignments_rl = []
+    prev_assigned_len = 0
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = env.step(int(action))
-        assignments_rl = env.assigned
+        # collect newly assigned patients without duplicating previous ones
+        new_assignments = env.assigned[prev_assigned_len:]
+        assignments_rl.extend(new_assignments)
+        prev_assigned_len = len(env.assigned)
     sum_rl = summarize(assignments_rl, env.n_doctors, env.n_slots)
 
     # baseline sobre los mismos pacientes
