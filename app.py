@@ -1,15 +1,18 @@
+# app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
-from stable_baselines3 import PPO
-from src.envs.clinic_scheduling_env import ClinicSchedulingEnv
+
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from src.envs.clinic_scheduling_env import ClinicSchedulingEnv  # Debe tener external_patients= y get_action_mask()
 from src.baselines import greedy_schedule
 from src.utils.metrics import summarize, assignments_to_df
-from src.utils.visualize import timeline_figure
-
 
 st.set_page_config(page_title="RL Clinic Scheduling", layout="wide")
-st.title("Scheduling inteligente para clínica (RL + PPO)")
+st.title("Scheduling inteligente para clínica (RL + MaskablePPO)")
 
 # ========================
 # Helpers de calendario ⬇️
@@ -26,199 +29,248 @@ def slot_label(slot_idx: int) -> str:
 def make_calendar(assignments, n_doctors: int, n_slots: int) -> pd.DataFrame:
     """
     Crea una tabla estilo calendario (filas = tiempo, columnas = doctores)
-    assignments: lista de tu entorno (pid, d, s, urgent, avail_start)
+    assignments: lista (pid, d, s, urgent, avail_start)
     """
     times = [slot_label(s) for s in range(n_slots)]
-    cal = pd.DataFrame("—", index=times, columns=[f"Doctor_{d}" for d in range(n_doctors)])
-    for (pid, d, s, urgent, _avail_start) in assignments:
-        marker = "🟥" if int(urgent) == 1 else "🟩"
-        cal.loc[slot_label(int(s)), f"Doctor_{int(d)}"] = f"{marker} Paciente_{int(pid)}"
+    cols = [f"Doctor_{d}" for d in range(n_doctors)]
+    cal = pd.DataFrame("—", index=times, columns=cols)
+    
+    for assignment in assignments:
+        # Handle both 4-tuple and 5-tuple formats
+        if len(assignment) == 4:
+            pid, d, s, urgent = assignment
+        else:
+            pid, d, s, urgent, _ = assignment
+            
+        d = int(d); s = int(s); urgent = int(urgent); pid = int(pid)
+        row = slot_label(s)
+        col = f"Doctor_{d}"
+        if row in cal.index and col in cal.columns:
+            marker = "🟥" if urgent == 1 else "🟩"
+            cal.at[row, col] = f"{marker} Paciente_{pid}"
     return cal
-# ========================
 
+def large_gaps(row: np.ndarray) -> int:
+    gaps, run = 0, 0
+    for v in row:
+        if v == 0:
+            run += 1
+        else:
+            if run > 2:
+                gaps += (run - 2)
+            run = 0
+    if run > 2:
+        gaps += (run - 2)
+    return gaps
+
+def build_grid_from_assignments(assignments, n_doctors, n_slots):
+    g = np.zeros((n_doctors, n_slots), dtype=int)
+    for (_, d, s, _urgent, _start) in assignments:
+        g[int(d), int(s)] = 1
+    return g
+
+def mask_fn(env):
+    # Acción válida = (doctor,slot) libre en la ventana del paciente; NO_OP siempre permitido
+    return env.get_action_mask()
+# ========================
 
 with st.sidebar:
     st.header("Parámetros del día")
     n_doctors = st.slider("Doctores", 1, 6, 3)
-    n_patients = st.slider("Pacientes", 0, 120, 60, step=5)
+    n_patients = st.slider("Pacientes (para entrenar)", 0, 120, 60, step=5)
     n_slots = 32
     seed = st.number_input("Seed", value=42)
-    timesteps = st.number_input("Entrenamiento (timesteps)", min_value=1000, value=500000, step=1000)
-    st.caption("💡 Más timesteps = mejor aprendizaje. Recomendado: 500K+ para buenos resultados.")
+    timesteps = st.number_input("Entrenamiento (timesteps)", min_value=1000, value=500_000, step=1000)
+    data_src = st.radio("Fuente de PACIENTES para SIMULAR", ["CSV (input/patients.csv)", "Generar aquí"], index=0)
+    st.caption("💡 Entrena con muestreo; SIMULA con un dataset fijo (CSV o generado) para comparar justo vs baseline.")
 
 col1, col2 = st.columns(2)
 
 if "model" not in st.session_state:
     st.session_state.model = None
 
-# Botón para generar y mostrar datos de ejemplo
-if st.button("📊 Generar datos de ejemplo"):
+# ========================
+# Generar/mostrar data de ejemplo (opcional)
+# ========================
+if st.button("📊 Generar datos de ejemplo (solo vista)"):
     from src.data.generate_data import gen_doctors, gen_patients
-    
-    # Generar datos con el seed actual
     np.random.seed(int(seed))
     doctors_df = gen_doctors(n_doctors)
     patients_df = gen_patients(n_patients)
-    
     st.subheader("📋 Doctores generados")
     st.dataframe(doctors_df, use_container_width=True)
-    
     st.subheader("🏥 Pacientes generados")
     st.dataframe(patients_df, use_container_width=True)
-    
-    # Mostrar estadísticas
     st.subheader("📈 Estadísticas")
-    urgent_count = patients_df['urgencia'].sum()
-    st.metric("Pacientes urgentes", int(urgent_count))
+    st.metric("Pacientes urgentes", int(patients_df['urgencia'].sum()))
     st.metric("Total pacientes", len(patients_df))
     st.metric("Total doctores", len(doctors_df))
 
-if st.button("Entrenar / Reentrenar PPO"):
-    with st.spinner("Entrenando modelo PPO..."):
+# ========================
+# ENTRENAMIENTO
+# ========================
+if st.button("Entrenar / Reentrenar MaskablePPO"):
+    with st.spinner("x..."):
         try:
-            env = ClinicSchedulingEnv(n_doctors=n_doctors, n_slots=n_slots, n_patients=n_patients, seed=int(seed))
-            
-            # Debug: Test environment first
+            # Sanity check rápido en un solo env
+            env_test = ClinicSchedulingEnv(n_doctors=n_doctors, n_slots=n_slots, n_patients=n_patients, seed=int(seed))
+            obs, _ = env_test.reset()
             st.info("🔍 Probando ambiente...")
-            obs, _ = env.reset()
-            st.write(f"Observación inicial: Grid shape {obs['grid'].shape}, Patient vector length {obs['patient'].shape}")
-            
-            # Test a few steps
+            st.write(f"Observación inicial: Grid {obs['grid'].shape}, Patient vec {obs['patient'].shape}")
             total_reward = 0
-            steps = 0
             for _ in range(5):
-                action = env.action_space.sample()  # Random action
-                obs, reward, terminated, truncated, info = env.step(action)
+                action = env_test.action_space.sample()
+                obs, reward, terminated, truncated, info = env_test.step(action)
                 total_reward += reward
-                steps += 1
                 if terminated:
                     break
-            
-            st.write(f"Test: {steps} pasos, reward total: {total_reward:.2f}")
-            st.write(f"Pacientes asignados: {len(env.assigned)}")
-            
-            # Mejor configuración de PPO para aprendizaje más efectivo
-            # Ajustar parámetros basados en el tamaño del problema
-            n_steps = max(32, min(128, n_patients // 2))  # Adaptar a número de pacientes
-            batch_size = max(16, min(64, n_steps // 2))    # Adaptar al batch size
-            
-            st.info(f"📊 Configuración PPO: n_steps={n_steps}, batch_size={batch_size}, n_epochs={10}")
-            st.info(f"📈 Esto creará aproximadamente {(timesteps // n_steps) * 10} épocas de aprendizaje")
-            
-            model = PPO(
-                "MultiInputPolicy", 
-                env, 
-                verbose=1,  # Mostrar progreso de entrenamiento
+            st.write(f"Test: reward total (≤5 pasos): {total_reward:.2f}")
+            st.write(f"Pacientes asignados (test): {len(env_test.assigned)}")
+            del env_test
+
+            # Entrenamiento con 1 env enmascarado (DummyVecEnv)
+            def make_env():
+                e = ClinicSchedulingEnv(n_doctors=n_doctors, n_slots=n_slots, n_patients=n_patients, seed=None)
+                return ActionMasker(e, mask_fn)
+            venv = DummyVecEnv([make_env])
+
+            # Hiperparámetros
+            n_steps = max(64, min(256, n_patients))
+            batch_size = max(64, min(256, n_steps))
+            st.info(f"📊 Config: n_steps={n_steps}, batch_size={batch_size}, n_epochs=10")
+
+            model = MaskablePPO(
+                "MultiInputPolicy",
+                venv,
+                verbose=1,
                 seed=int(seed),
-                learning_rate=1e-3,      # Learning rate más alto para aprendizaje más rápido
-                ent_coef=0.05,           # Más exploración
-                n_steps=n_steps,         # Adaptado al número de pacientes
-                batch_size=batch_size,   # Adaptado al batch size
-                n_epochs=10,             # Más épocas por batch
-                gamma=0.99,              # Factor de descuento
-                gae_lambda=0.95,         # GAE lambda
-                clip_range=0.2,          # Clipping del ratio de políticas
-                tensorboard_log=f"./logs/PPO_{n_doctors}docs_{n_patients}patients"  # Logs con parámetros
+                learning_rate=1e-3,
+                ent_coef=0.01,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=10,
+                gamma=0.99,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                tensorboard_log=f"./logs/PPO_mask_{n_doctors}docs_{n_patients}patients"
             )
-            
-            # Barra de progreso para el entrenamiento
+
+            # Progreso
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            # Callback personalizado para monitorear el progreso
             class ProgressCallback:
-                def __init__(self, total_timesteps):
-                    self.total_timesteps = total_timesteps
-                    self.current_step = 0
-                    self.episode_count = 0
-                    self.last_step = 0
-                
+                def __init__(self, total_timesteps): self.total_timesteps = total_timesteps
                 def __call__(self, locals, globals):
-                    self.current_step = locals['self'].num_timesteps
-                    
-                    # Count episodes
-                    if self.current_step > self.last_step:
-                        self.episode_count += 1
-                        self.last_step = self.current_step
-                    
-                    progress = min(self.current_step / self.total_timesteps, 1.0)
-                    progress_bar.progress(progress)
-                    status_text.text(f"Entrenando... {self.current_step:,}/{self.total_timesteps:,} timesteps | Episodios: {self.episode_count}")
+                    cur = locals['self'].num_timesteps
+                    progress_bar.progress(min(cur / self.total_timesteps, 1.0))
+                    status_text.text(f"Entrenando... {cur:,}/{self.total_timesteps:,} timesteps")
                     return True
-            
-            callback = ProgressCallback(int(timesteps))
-            
-            # Entrenar con callback de progreso
-            model.learn(total_timesteps=int(timesteps), callback=callback)
-            
+            model.learn(total_timesteps=int(timesteps), callback=ProgressCallback(int(timesteps)))
+
             st.session_state.model = model
-            st.success(f"Modelo entrenado exitosamente en {timesteps:,} timesteps!")
-            
-            # Mostrar estadísticas del entrenamiento
+            st.success(f"Modelo enmascarado entrenado en {timesteps:,} timesteps ✔️")
             if hasattr(model, 'logger') and model.logger is not None:
-                st.info("📊 Estadísticas de entrenamiento disponibles en logs/")
-            
+                st.info("📊 Estadísticas de entrenamiento en logs/")
+
         except Exception as e:
             st.error(f"Error durante el entrenamiento: {str(e)}")
             st.write("Detalles del error:", e)
 
-# Generar un día y evaluar
-# Generar un día y evaluar
+# ========================
+# SIMULAR Y COMPARAR
+# ========================
+def df_to_patients_list(df: pd.DataFrame):
+    cols = ["paciente_id","urgencia","avail_start_slot","avail_end_slot"]
+    df = df[cols].copy()
+    for c in cols: df[c] = df[c].astype(int)
+    return df.to_dict("records")
+
 if st.button("Simular día y comparar"):
     try:
-        # Creamos un env fijo para este día
-        env = ClinicSchedulingEnv(n_doctors=n_doctors, n_slots=n_slots, n_patients=n_patients, seed=int(seed))
-        env.max_days = 1  # ← Fuerza comparación de UN solo día
+        # 1) Cargar/Generar pacientes de hoy (dataset fijo para la simulación)
+        if data_src.startswith("CSV"):
+            try:
+                patients_df = pd.read_csv("input/patients.csv")
+            except FileNotFoundError:
+                st.error("No encuentro input/patients.csv. Cambia a 'Generar aquí' o coloca el CSV en esa ruta.")
+                st.stop()
+        else:
+            from src.data.generate_data import gen_patients
+            patients_df = gen_patients(n_patients)
+
+        patients_today = df_to_patients_list(patients_df)
+
+        # 2) Crear env de evaluación con pacientes EXTERNOS fijos
+        eval_env = ClinicSchedulingEnv(
+            n_doctors=n_doctors,
+            n_slots=n_slots,
+            n_patients=len(patients_today),
+            seed=int(seed),
+            external_patients=patients_today,   # <-- clave
+        )
+        eval_env.max_days = 1
+        env = ActionMasker(eval_env, mask_fn)
         obs, _ = env.reset()
 
-        # Congelar el set de pacientes de hoy para que RL y baseline vean EXACTAMENTE lo mismo
-        from copy import deepcopy
-        patients_today = deepcopy(env.patients)
-
-        # RL
+        # 3) Modelo (quick o entrenado). Entrenar SIEMPRE en OTRO ENV.
         if st.session_state.model is None:
-            st.warning("Primero entrena el modelo (sidebar). Usaré un modelo recién entrenado rápido.")
-            model = PPO("MultiInputPolicy", env, verbose=1, seed=int(seed), learning_rate=3e-4, ent_coef=0.01, n_steps=1024, batch_size=256)
+            st.warning("No hay modelo entrenado. Entrenaré uno rápido solo para la demo (en otro env).")
+            def make_train_env():
+                e = ClinicSchedulingEnv(n_doctors=n_doctors, n_slots=n_slots, n_patients=n_patients, seed=int(seed)+999)
+                return ActionMasker(e, mask_fn)
+            train_venv = DummyVecEnv([make_train_env])
+            model = MaskablePPO("MultiInputPolicy", train_venv, verbose=0, seed=int(seed),
+                                learning_rate=3e-4, ent_coef=0.01, n_steps=512, batch_size=256)
             model.learn(total_timesteps=20_000)
+            del train_venv
         else:
             model = st.session_state.model
 
+        # 🔄 Resetear SIEMPRE el env de evaluación después de cualquier entrenamiento
+        obs, _ = env.reset()
+
+        # 4) Rollout limpio
         done = False
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = env.step(int(action))
 
-        ass_rl = env.assigned
-        sum_rl = summarize(ass_rl, env.n_doctors, env.n_slots)
+        # ===== RL outputs =====
+        base_env = env.unwrapped
+        ass_rl = base_env.assigned
+        sum_rl = summarize(ass_rl, base_env.n_doctors, base_env.n_slots)
         df_rl = assignments_to_df(ass_rl)
 
-        # Debug opcional
-        st.write(f"RL assignments count: {len(ass_rl)}")
-        st.write(f"RL dataframe shape: {df_rl.shape}")
-        if len(df_rl) > 0:
-            st.write("RL dataframe preview:")
-            st.dataframe(df_rl.head(), use_container_width=True)
+        # Chequeo de consistencia grid vs assignments
+        G_from_ass = build_grid_from_assignments(ass_rl, base_env.n_doctors, base_env.n_slots)
+        mismatch = int((G_from_ass != base_env.grid).sum())
+        if mismatch != 0:
+            st.error(f"⚠️ Inconsistencia: {mismatch} celdas difieren entre grid y assignments.")
+        else:
+            filled = int(base_env.grid.sum())
+            capacity = base_env.n_doctors * base_env.n_slots
+            lg_total = sum(large_gaps(base_env.grid[d]) for d in range(base_env.n_doctors))
+            st.info(f"RL — ocupación directa: {filled}/{capacity} ({filled/capacity*100:.1f}%), huecos>30: {lg_total}")
 
-        # Baseline greedy sobre los MISMOS pacientes congelados
-        ass_bl, grid_bl = greedy_schedule(patients_today, env.n_doctors, env.n_slots)
-        sum_bl = summarize(ass_bl, env.n_doctors, env.n_slots)
+        # ===== Baseline greedy con los MISMOS pacientes =====
+        ass_bl, grid_bl = greedy_schedule(patients_today, base_env.n_doctors, base_env.n_slots)
+        sum_bl = summarize(ass_bl, base_env.n_doctors, base_env.n_slots)
         df_bl = assignments_to_df(ass_bl)
-
-        # Debug opcional
-        st.write(f"Greedy assignments count: {len(ass_bl)}")
-        st.write(f"Greedy dataframe shape: {df_bl.shape}")
-        if len(df_bl) > 0:
-            st.write("Greedy dataframe preview:")
-            st.dataframe(df_bl.head(), use_container_width=True)
 
         # ====== Visualización por columnas ======
         with col1:
-            st.subheader("RL (PPO)")
+            st.subheader("RL (MaskablePPO)")
             st.metric("Utilización", f"{sum_rl['utilization']*100:.1f}%")
             st.metric("Huecos >30min", f"{sum_rl['large_gaps']}")
             st.metric("Latencia urgencias (slots)", f"{sum_rl['avg_urgent_latency']:.2f}")
             if len(ass_rl) > 0:
-                cal_rl = make_calendar(ass_rl, env.n_doctors, env.n_slots)
+                # 🔍 ADD DEBUG LINES HERE (using print for terminal output)
+                print("🔍 Debug - RL assignments data type:", type(ass_rl))
+                print("🔍 Debug - RL assignments length:", len(ass_rl))
+                print("🔍 Debug - First 5 RL assignments:", ass_rl[:5])
+                print("🔍 Debug - About to create RL calendar with:", len(ass_rl), "assignments")
+                
+                cal_rl = make_calendar(ass_rl, base_env.n_doctors, base_env.n_slots)
                 st.subheader("Calendario — PPO (RL)")
                 st.dataframe(cal_rl, use_container_width=True)
 
@@ -228,27 +280,31 @@ if st.button("Simular día y comparar"):
             st.metric("Huecos >30min", f"{sum_bl['large_gaps']}")
             st.metric("Latencia urgencias (slots)", f"{sum_bl['avg_urgent_latency']:.2f}")
             if len(ass_bl) > 0:
-                cal_bl = make_calendar(ass_bl, env.n_doctors, env.n_slots)
+                cal_bl = make_calendar(ass_bl, base_env.n_doctors, base_env.n_slots)
                 st.subheader("Calendario — Greedy (baseline)")
                 st.dataframe(cal_bl, use_container_width=True)
 
         st.caption("Leyenda: 🟩 Normal • 🟥 Urgencia • — Libre")
-        # ========================================
+
+        # ===== Diagnóstico del episodio =====
+        with st.expander("Diagnóstico del episodio (RL)"):
+            st.write("Primeras 10 assignments RL:", [tuple(x) for x in ass_rl[:10]])
+            st.write("Grid RL (sumas por doctor):", base_env.grid.sum(axis=1).tolist())
+            st.write("Gaps>30 por doctor:", [large_gaps(base_env.grid[d]) for d in range(base_env.n_doctors)])
 
     except Exception as e:
-        st.error(f"Error during simulation: {str(e)}")
+        st.error(f"Error durante la simulación: {str(e)}")
         st.write("Full error details:", e)
-
 
 st.markdown("---")
 with st.expander("Detalles y extensiones sugeridas"):
     st.markdown(
         """
+        - **Acciones enmascaradas** (MaskablePPO + ActionMasker) → evita acciones inválidas.
         - **Duraciones variables** (p.ej., 2 slots) y **especialidades** por doctor.
         - **Penalidad por cambios** entre doctores / back-to-back sin buffer.
         - **No-shows** y **overbooking** probabilístico.
-        - **Reward shaping**: ponderar más la latencia de urgencias.
-        - **Baseline ILP/CP-SAT** (OR-Tools) para un óptimo exacto en instancias pequeñas.
-        - **RAG** o reglas clínicas para restricciones avanzadas.
+        - **Reward shaping**: penalizar latencia de urgencias y huecos grandes.
+        - **Baseline ILP/CP-SAT** (OR-Tools) para óptimos exactos en instancias pequeñas.
         """
     )

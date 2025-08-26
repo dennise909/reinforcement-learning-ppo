@@ -15,7 +15,7 @@ class ClinicSchedulingEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, n_doctors=3, n_slots=32, n_patients=60, seed=42, max_days=5, debug=False):
+    def __init__(self, n_doctors=3, n_slots=32, n_patients=60, seed=42, max_days=5, debug=False, external_patients=None):
         super().__init__()
         self.n_doctors = n_doctors
         self.n_slots = n_slots
@@ -23,6 +23,7 @@ class ClinicSchedulingEnv(gym.Env):
         self.seed = seed
         self.max_days = max_days
         self.debug = debug
+        self.external_patients = external_patients
 
         # Constants / helpers
         self.NO_OP = self.n_doctors * self.n_slots  # last action index
@@ -66,7 +67,7 @@ class ClinicSchedulingEnv(gym.Env):
         }
 
     # ---------- Gym API ----------
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
         # Let Gymnasium handle seeding and create self.np_random
         if seed is not None:
             super().reset(seed=seed)
@@ -77,8 +78,10 @@ class ClinicSchedulingEnv(gym.Env):
         self.day_count = 0
         self.grid = np.zeros((self.n_doctors, self.n_slots), dtype=np.int8)
 
-        self.patients = self._sample_patients()
-        self.patients.sort(key=lambda p: (-(p["urgencia"]), p["avail_start_slot"]))
+        if self.external_patients is not None:
+            self.patients = self.external_patients
+        else:
+            self.patients = self._sample_patients()
         self.patient_idx = 0
         self.assigned = []
         self.invalid_tries = 0
@@ -105,8 +108,10 @@ class ClinicSchedulingEnv(gym.Env):
                 # Move to next day
                 self.day_count += 1
                 self.grid = np.zeros((self.n_doctors, self.n_slots), dtype=np.int8)
-                self.patients = self._sample_patients()
-                self.patients.sort(key=lambda p: (-(p["urgencia"]), p["avail_start_slot"]))
+                if self.external_patients is not None:
+                    self.patients = self.external_patients
+                else:
+                    self.patients = self._sample_patients()
                 self.patient_idx = 0
                 self.assigned = []
                 self.invalid_tries = 0
@@ -146,6 +151,9 @@ class ClinicSchedulingEnv(gym.Env):
 
         # ---- Process current patient ----
         patient = self.patients[self.patient_idx]
+        print(f"🔍 RL Step: Patient {patient['paciente_id']} (urgent={patient['urgencia']}, avail_start={patient['avail_start_slot']})")
+        print(f"🔍 Action: {action} -> Doctor {action // self.n_slots}, Slot {action % self.n_slots}")
+
         info["current_patient"] = {
             "id": patient["paciente_id"],
             "urgent": patient["urgencia"],
@@ -176,6 +184,7 @@ class ClinicSchedulingEnv(gym.Env):
         if valid:
             self.grid[d, s] = 1
             self.assigned.append((patient["paciente_id"], d, s, patient["urgencia"], patient["avail_start_slot"]))
+            print(f"✅ RL Assignment: Patient {patient['paciente_id']} -> Doctor {d}, Slot {s}, Urgent: {patient['urgencia']}")
             self.total_assigned += 1
 
             # Base reward
